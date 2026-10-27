@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/dal-go/record"
 	"github.com/redis/go-redis/v9"
+	"net/url"
 	"os"
 	"reflect"
 	"strings"
@@ -83,4 +84,35 @@ func TestRedisIntegration(t *testing.T) {
 	if _, e = c.Query(cancelled, "GET", key); e == nil {
 		t.Fatal("cancellation ignored")
 	}
+	// Verify real Redis ACL authentication and denial, beyond client-side guards.
+	username := prefix + "-reader"
+	password := "test-only-password"
+	if e = seed.Do(ctx, "ACL", "SETUSER", username, "reset", "on", ">"+password, "~"+prefix+":*", "+@connection", "+get", "+mget").Err(); e != nil {
+		t.Fatal(e)
+	}
+	defer seed.Do(context.Background(), "ACL", "DELUSER", username)
+	endpoint, e := url.Parse(raw)
+	if e != nil {
+		t.Fatal(e)
+	}
+	endpoint.User = url.UserPassword(username, password)
+	reader, e := Open(ctx, endpoint.String())
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer reader.Close()
+	if v, e := reader.Query(ctx, "GET", key); e != nil || v != "hello" {
+		t.Fatalf("ACL read: %v %v", v, e)
+	}
+	if _, e = reader.Query(ctx, "GET", "outside-allowed-prefix"); e == nil {
+		t.Fatal("ACL key restriction ignored")
+	}
+	if _, e = reader.Query(ctx, "HGET", hash, "name"); e == nil {
+		t.Fatal("ACL command restriction ignored")
+	}
+	endpoint.User = url.UserPassword(username, "wrong-password-secret")
+	if _, e = Open(ctx, endpoint.String()); e == nil || strings.Contains(e.Error(), "wrong-password-secret") {
+		t.Fatalf("unsafe auth error: %v", e)
+	}
+
 }
