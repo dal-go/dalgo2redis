@@ -2,6 +2,7 @@ package dalgo2redis
 
 import (
 	"context"
+	"errors"
 	"github.com/dal-go/record"
 	"github.com/redis/go-redis/v9"
 	"net/url"
@@ -83,6 +84,19 @@ func TestRedisIntegration(t *testing.T) {
 	stop()
 	if _, e = c.Query(cancelled, "GET", key); e == nil {
 		t.Fatal("cancellation ignored")
+	}
+	// Oversized real replies must fail before driver parsing and leave the pool usable.
+	if e = seed.Set(ctx, key, strings.Repeat("x", MaxResponseBytes), time.Minute).Err(); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = c.Query(ctx, "GET", key); !errors.Is(e, errResponseBudget) {
+		t.Fatalf("oversize response: %v", e)
+	}
+	if e = seed.Set(ctx, key, "hello", time.Minute).Err(); e != nil {
+		t.Fatal(e)
+	}
+	if v, e := c.Query(ctx, "GET", key); e != nil || v != "hello" {
+		t.Fatalf("pool recovery: %v %v", v, e)
 	}
 	// Verify real Redis ACL authentication and denial, beyond client-side guards.
 	username := prefix + "-reader"

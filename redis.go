@@ -2,9 +2,12 @@
 package dalgo2redis
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -33,6 +36,22 @@ func Open(ctx context.Context, rawURL string) (*Client, error) {
 	opts.WriteTimeout = 5 * time.Second
 	opts.ContextTimeoutEnabled = true
 	opts.MaxRetries = -1
+	opts.Protocol = 2
+	opts.DisableIdentity = true
+	opts.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialer := &net.Dialer{Timeout: opts.DialTimeout}
+		var conn net.Conn
+		var err error
+		if opts.TLSConfig != nil {
+			conn, err = (&tls.Dialer{NetDialer: dialer, Config: opts.TLSConfig}).DialContext(ctx, network, addr)
+		} else {
+			conn, err = dialer.DialContext(ctx, network, addr)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &boundedConn{Conn: conn, reader: bufio.NewReaderSize(conn, 4096)}, nil
+	}
 	c := &Client{client: redis.NewClient(opts), id: fmt.Sprintf("redis:%d", opts.DB)}
 	if err := c.client.Ping(ctx).Err(); err != nil {
 		_ = c.Close()
@@ -96,6 +115,9 @@ func (c *Client) Query(ctx context.Context, args ...string) (any, error) {
 		return nil, nil
 	}
 	if err != nil {
+		if errors.Is(err, errResponseBudget) {
+			return nil, errResponseBudget
+		}
 		if timeout.Err() != nil {
 			return nil, timeout.Err()
 		}

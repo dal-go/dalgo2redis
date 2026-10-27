@@ -21,8 +21,9 @@ STRLEN, HLEN, LLEN, SCARD and ZCARD. Each call accepts at most 128 arguments
 and 64 KiB of command text, and has a ten second deadline. GET/HGET return nil
 for absent values; MGET/HMGET preserve positions with nil entries. Redis errors
 (including WRONGTYPE and ACL denial) remain errors. Values are strings.
-Value sizes are controlled by Redis data and server ACLs; there is no hard
-response byte limit. Multi-key reads are not a snapshot across calls.
+Each RESP reply is limited to 1 MiB before the Redis driver reads length
+headers, preventing oversized bulk allocations. Oversized replies fail and close
+the connection; later reads reconnect. RESP nesting is capped at 16 levels. Multi-key reads are not a snapshot across calls.
 
 `client.DB()` implements DALgo string record reads (`key` and `value` map
 fields). Record IDs are exact Redis keys in the chosen numeric database;
