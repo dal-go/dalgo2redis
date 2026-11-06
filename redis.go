@@ -17,16 +17,27 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Client owns the Redis connection pool. Close it when finished.
+// Client owns bounded operation-specific read connections. Close it when finished.
 // Redis ACLs remain the authority: use a dedicated read-only account.
 type Client struct {
-	client *redis.Client
-	id     string
+	client  *redis.Client
+	id      string
+	options Options
+	reads   *readOwner
 }
 
 // Open accepts redis:// or rediss:// URLs, including ACL credentials and /DB.
 // Errors deliberately omit URLs, credentials and server-provided messages.
 func Open(ctx context.Context, rawURL string) (*Client, error) {
+	return OpenWithOptions(ctx, rawURL, Options{})
+}
+
+// OpenWithOptions adds an explicit, trusted enumeration scope. The caller owns
+// this configuration; do not take ScanPrefix from an untrusted HTTP request.
+func OpenWithOptions(ctx context.Context, rawURL string, options Options) (*Client, error) {
+	if err := validateOptions(options); err != nil {
+		return nil, err
+	}
 	opts, err := redis.ParseURL(rawURL)
 	if err != nil {
 		return nil, errors.New("invalid Redis connection URL")
@@ -52,19 +63,53 @@ func Open(ctx context.Context, rawURL string) (*Client, error) {
 		}
 		return &boundedConn{Conn: conn, reader: bufio.NewReaderSize(conn, 4096)}, nil
 	}
-	c := &Client{client: redis.NewClient(opts), id: fmt.Sprintf("redis:%d", opts.DB)}
-	if err := c.client.Ping(ctx).Err(); err != nil {
+	c := &Client{client: redis.NewClient(opts), id: fmt.Sprintf("redis:%d", opts.DB), options: options}
+	c.reads = newReadOwner(c.client.Options())
+	closed := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = c.client.Close()
+		close(closed)
+	})
+	pingErr := c.client.Ping(ctx).Err()
+	if !stop() {
+		<-closed
+	}
+	if err := ctx.Err(); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if pingErr != nil {
 		_ = c.Close()
 		return nil, errors.New("Redis connection failed; check endpoint, credentials and ACL")
 	}
+	// The verification connection is not retained in addition to the admitted
+	// read drivers: total live reads stay within the original pool limit.
+	_ = c.client.Close()
+	if err := ctx.Err(); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
 	return c, nil
 }
-func (c *Client) Close() error { return c.client.Close() }
+func (c *Client) Close() error {
+	if c.reads != nil {
+		c.reads.close()
+	}
+	err := c.client.Close()
+	if errors.Is(err, redis.ErrClosed) {
+		return nil
+	}
+	return err
+}
 
 // ValidateCommand rejects writes, scripts, administrative commands, key scans,
 // transactions, blocking reads and unbounded collection reads before network I/O.
 // At most 128 key/field arguments and 64 KiB of command text are accepted.
 func ValidateCommand(args []string) error {
+	return ValidateCommandWithOptions(args, Options{})
+}
+
+func validateRead(args []string) error {
 	if len(args) < 2 || len(args) > 129 {
 		return errors.New("Redis read requires a command and 1 to 128 arguments")
 	}
@@ -81,47 +126,79 @@ func ValidateCommand(args []string) error {
 		if len(args) != 2 {
 			return errors.New("Redis command requires exactly one key")
 		}
-	case "HGET", "HEXISTS":
+	case "HGET", "HEXISTS", "ZSCORE":
 		if len(args) != 3 {
-			return errors.New("Redis hash command requires one key and one field")
+			return errors.New("Redis command requires one key and one field or member")
 		}
 	case "HMGET":
 		if len(args) < 3 {
 			return errors.New("Redis HMGET requires a key and fields")
 		}
 	case "MGET", "EXISTS":
+	case "SCAN":
+		return validateScan(args)
 	default:
-		return errors.New("unsupported Redis read command; allowed: GET, MGET, HGET, HMGET, HEXISTS, EXISTS, TYPE, TTL, PTTL, STRLEN, HLEN, LLEN, SCARD, ZCARD")
+		return errors.New("unsupported Redis read command; allowed: GET, MGET, HGET, HMGET, HEXISTS, EXISTS, TYPE, TTL, PTTL, STRLEN, HLEN, LLEN, SCARD, ZCARD, ZSCORE; SCAN requires a configured prefix")
 	}
 	return nil
 }
 
 // Query executes exactly one validated read. Missing string/hash values are nil.
-// Redis values are returned as strings; arrays preserve order and missing values.
+// Redis bulk values are Go strings and integers are int64; arrays preserve order
+// and missing values. Use QueryNative for lossless JavaScript-facing JSON.
 // Reads across keys are not a transaction or snapshot.
 func (c *Client) Query(ctx context.Context, args ...string) (any, error) {
-	if err := ValidateCommand(args); err != nil {
+	return c.query(ctx, args, nil)
+}
+
+// query retains one deadline through command execution, optional lossless
+// conversion and the last delivery check. The conversion cannot expand authority.
+func (c *Client) query(ctx context.Context, args []string, convert func(string, any) (any, error)) (any, error) {
+	admitted, err := prepareCommand(args, c.options)
+	if err != nil {
 		return nil, err
 	}
 	timeout, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	values := make([]any, len(args))
-	for i, v := range args {
+	driver := c.client
+	if c.reads != nil {
+		var release func()
+		driver, release, err = c.reads.acquire(timeout, cancel)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+	}
+	values := make([]any, len(admitted))
+	for i, v := range admitted {
 		values[i] = v
 	}
-	values[0] = strings.ToUpper(args[0])
-	result, err := c.client.Do(timeout, values...).Result()
+	result, err := driver.Do(timeout, values...).Result()
+	if deadlineErr := timeout.Err(); deadlineErr != nil {
+		return nil, deadlineErr
+	}
 	if errors.Is(err, redis.Nil) {
-		return nil, nil
+		result, err = nil, nil
 	}
 	if err != nil {
 		if errors.Is(err, errResponseBudget) {
 			return nil, errResponseBudget
 		}
-		if timeout.Err() != nil {
-			return nil, timeout.Err()
-		}
 		return nil, errors.New("Redis read failed; check command, key type and ACL")
+	}
+	if admitted[0] == "SCAN" {
+		if err := validateScanReply(result, c.options.ScanPrefix); err != nil {
+			return nil, err
+		}
+	}
+	if convert != nil {
+		result, err = convert(admitted[0], result)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if deadlineErr := timeout.Err(); deadlineErr != nil {
+		return nil, deadlineErr
 	}
 	return result, nil
 }
