@@ -3,7 +3,7 @@ module github.com/dal-go/dalgo2redis
 go 1.27.0
 
 require (
-	github.com/dal-go/dalgo v0.101.4
+	github.com/dal-go/dalgo v0.102.0
 	github.com/dal-go/record v0.1.5
 	github.com/redis/go-redis/v9 v9.23.0
 )
