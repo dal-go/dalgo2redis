@@ -88,3 +88,56 @@ discovery and writes return `dal.ErrNotSupported`.
 Run unit tests with `go test ./...`. Set `REDIS_TEST_URL` to a disposable real
 Redis database to run integration tests. Fixtures use unique keys and remove
 only those keys. CI runs these tests against Redis 7.4.
+
+### Upstash REST reads
+
+`NewRESTClient(endpoint, RESTOptions)` is an independent HTTPS transport in this
+same adapter. It sends the documented JSON command array to the endpoint root,
+with `Authorization: Bearer` and `Upstash-Response-Format: resp2`. It does not
+send `Upstash-Encoding`, use query-string tokens, follow redirects, or retry with
+other credentials. See the [official REST contract](https://upstash.com/docs/redis/features/restapi).
+
+```go
+client, err := dalgo2redis.NewRESTClient(endpoint, dalgo2redis.RESTOptions{
+    TokenProvider: func(ctx context.Context) (string, error) {
+        return readScopedToken(ctx) // application-owned secret/token provider
+    },
+    Options: dalgo2redis.Options{ScanPrefix: "owned:"}, // omit to disable SCAN
+})
+// Handle err, then defer client.Close(). No network request occurs until Query.
+value, err := client.QueryNative(ctx, "GET", "owned:key")
+```
+
+`Query`, `QueryNative`, and `DB` reuse the existing command policy, flat-key
+DALgo backend, lossless native values and SCAN response checks. JSON command
+arguments and the configured prefix must be valid UTF-8; invalid input is
+refused rather than changing a binary key during JSON encoding. Returned bulk
+bytes, including non-UTF8 data and SCAN key suffixes, remain exact. Legacy Go
+strings/int64 and lossless tagged JSON are the same two contracts as TCP.
+
+The complete encoded command must fit 64 KiB. RESP2 replies retain the shared
+1 MiB frame, 256-element array and depth-16 limits, and must contain exactly one
+frame. A whole page exceeding its byte/shape/prefix bounds fails without partial
+results. SCAN's COUNT remains a hint; no snapshot is implied. Upstash's default
+Read Only token can deny SCAN/KEYS. Enumeration requires a separately permitted,
+scoped ACL-user REST token, and never falls back to KEYS or an admin token.
+
+Each client owns a cloned standard HTTP transport with TLS verification,
+TLS1.2 minimum, no proxies, a 64 KiB response-header cap and four concurrent
+requests. HTTP loopback is available only through the explicit
+`InsecureLoopbackForTesting` option and an IP loopback endpoint. Supplied custom
+dialing/TLS callbacks are trusted application configuration. Token providers
+receive the same end-to-end context as fetch, body decoding and conversion;
+the default deadline is ten seconds. Caller cancellation and deadline errors
+retain the standard context sentinels without custom causes or backend text.
+Cleanup precedes the final delivery check. Close cancels owned requests and
+closes their idle connections, without touching a TCP client's pool. A token
+provider that ignores context can retain its own work, but at most four calls
+per REST client remain outstanding and neither callers nor Close wait for them.
+
+Only read commands are implemented. The service has writes and atomic
+`multi-exec` batches, but this adapter adds neither. Callback transactions,
+structured queries and schema discovery remain refused. Tests use owned
+HTTP/TLS contract fixtures; they do not establish hosted Upstash authentication,
+quota behavior, CORS or installed CLI support. No hosted account is required
+for those local fixtures.

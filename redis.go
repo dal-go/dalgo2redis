@@ -206,11 +206,23 @@ func (c *Client) query(ctx context.Context, args []string, convert func(string, 
 // DB exposes Redis strings through DALgo record keys. Collections are ignored:
 // Redis keys share the selected numeric database's flat namespace. Data is a map
 // with key and value fields. Structured queries and all writes are unsupported.
-func (c *Client) DB() dal.DB { return dal.NewDB(&backend{Client: c}) }
+func (c *Client) DB() dal.DB { return flatKeyDB(c, c.id) }
+
+type readClient interface {
+	Query(context.Context, ...string) (any, error)
+	QueryNative(context.Context, ...string) (NativeValue, error)
+	Close() error
+	DB() dal.DB
+}
+
+func flatKeyDB(client readClient, id string) dal.DB {
+	return dal.NewDB(&backend{readClient: client, id: id})
+}
 
 type backend struct {
 	dal.NoConcurrency
-	*Client
+	readClient
+	id string
 }
 
 var _ dal.Backend = (*backend)(nil)
