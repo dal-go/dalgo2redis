@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/dal-go/dalgo v0.102.6
 	github.com/dal-go/record v0.1.5
-	github.com/redis/go-redis/v9 v9.23.0
+	github.com/redis/go-redis/v9 v9.24.0
 )
 
 require (
@@ -16,5 +16,5 @@ require (
 	github.com/mschoch/smat v0.2.0 // indirect
 	github.com/strongo/random v0.0.3 // indirect
 	go.uber.org/atomic v1.12.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 )
