@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -28,15 +29,15 @@ func newLaggingDeadline(after time.Duration) laggingDeadline {
 func sleepUntil(at time.Time) { time.Sleep(time.Until(at) + time.Millisecond) }
 
 func TestQueryReportsADeadlineThatOutrunsTheContextTimer(t *testing.T) {
-	ctx := newLaggingDeadline(20 * time.Millisecond)
-	driver := redis.NewClient(&redis.Options{})
-	t.Cleanup(func() { _ = driver.Close() })
-	driver.AddHook(nativeResultHook{process: func(context.Context, redis.Cmder) error {
-		sleepUntil(ctx.at)
-		return &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
-	}})
-	client := &Client{client: driver}
 	for _, native := range []bool{false, true} {
+		ctx := newLaggingDeadline(20 * time.Millisecond)
+		driver := redis.NewClient(&redis.Options{})
+		t.Cleanup(func() { _ = driver.Close() })
+		driver.AddHook(nativeResultHook{process: func(context.Context, redis.Cmder) error {
+			sleepUntil(ctx.at)
+			return &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+		}})
+		client := &Client{client: driver}
 		var err error
 		if native {
 			_, err = client.QueryNative(ctx, "GET", "key")
@@ -66,22 +67,45 @@ func TestOpenReportsADeadlineThatOutrunsTheContextTimer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = listener.Close() })
+	accepted := make(chan []net.Conn, 1)
 	go func() {
+		// Hold every connection open without replying, so the ping times out.
+		var conns []net.Conn
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
+				accepted <- conns
 				return
 			}
-			t.Cleanup(func() { _ = conn.Close() })
+			conns = append(conns, conn)
 		}
 	}()
-	ctx := newLaggingDeadline(100 * time.Millisecond)
+	t.Cleanup(func() {
+		_ = listener.Close()
+		for _, conn := range <-accepted {
+			_ = conn.Close()
+		}
+	})
+	ctx := newLaggingDeadline(200 * time.Millisecond)
 	client, err := Open(ctx, "redis://"+listener.Addr().String()+"/0")
 	if client != nil {
 		_ = client.Close()
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("ping timing out at the deadline reported as %v", err)
+	}
+}
+
+func TestRESTRejectsAReplyArrivingAfterTheDeadline(t *testing.T) {
+	ctx := newLaggingDeadline(50 * time.Millisecond)
+	client, _ := restFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if !drainRESTFixtureRequest(w, r) {
+			return
+		}
+		sleepUntil(ctx.at)
+		restReply(w, "$1\r\nx\r\n")
+	}, RESTOptions{})
+	if _, err := client.QueryNative(ctx, "GET", "key"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("REST reply after the deadline delivered: %v", err)
 	}
 }

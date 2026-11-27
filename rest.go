@@ -276,7 +276,7 @@ func (c *RESTClient) queryREST(parent context.Context, args []string, convert fu
 		if release != nil {
 			release()
 		}
-		if contextErr := ctx.Err(); contextErr != nil {
+		if contextErr := expired(ctx); contextErr != nil {
 			value, err = nil, contextErr
 		} else if err == nil && closeErr != nil {
 			value, err = nil, ErrRESTTransport
