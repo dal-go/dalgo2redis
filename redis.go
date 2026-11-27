@@ -74,7 +74,7 @@ func OpenWithOptions(ctx context.Context, rawURL string, options Options) (*Clie
 	if !stop() {
 		<-closed
 	}
-	if err := ctx.Err(); err != nil {
+	if err := expired(ctx); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -85,7 +85,7 @@ func OpenWithOptions(ctx context.Context, rawURL string, options Options) (*Clie
 	// The verification connection is not retained in addition to the admitted
 	// read drivers: total live reads stay within the original pool limit.
 	_ = c.client.Close()
-	if err := ctx.Err(); err != nil {
+	if err := expired(ctx); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -174,7 +174,7 @@ func (c *Client) query(ctx context.Context, args []string, convert func(string, 
 		values[i] = v
 	}
 	result, err := driver.Do(timeout, values...).Result()
-	if deadlineErr := timeout.Err(); deadlineErr != nil {
+	if deadlineErr := expired(timeout); deadlineErr != nil {
 		return nil, deadlineErr
 	}
 	if errors.Is(err, redis.Nil) {
@@ -197,7 +197,7 @@ func (c *Client) query(ctx context.Context, args []string, convert func(string, 
 			return nil, err
 		}
 	}
-	if deadlineErr := timeout.Err(); deadlineErr != nil {
+	if deadlineErr := expired(timeout); deadlineErr != nil {
 		return nil, deadlineErr
 	}
 	return result, nil
@@ -267,4 +267,18 @@ func (b *backend) ExecuteQueryToRecordsReader(context.Context, dal.Query) (dal.R
 }
 func (b *backend) ExecuteQueryToRecordsetReader(context.Context, dal.Query, ...recordset.Option) (dal.RecordsetReader, error) {
 	return nil, dal.ErrNotSupported
+}
+
+// expired reports ctx's error, or DeadlineExceeded once its deadline has
+// passed. go-redis sets the socket deadline from the context deadline, so a read
+// can time out a moment before the context's own timer marks it done; that
+// failure is the deadline, not a server or ACL error.
+func expired(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
